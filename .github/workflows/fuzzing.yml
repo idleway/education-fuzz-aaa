@@ -1,148 +1,148 @@
 name: Fuzzing
 
 on:
-push:
-branches: [ main ]
+  push:
+    branches: [ main ]
 
 permissions:
-contents: read
+  contents: read
 
 jobs:
-ffuf:
-runs-on: ubuntu-latest
-timeout-minutes: 15
+  ffuf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
-services:
-  juice:
-    image: bkimminich/juice-shop:v17.1.1
-    ports:
-      - 3000:3000
+    services:
+      juice:
+        image: bkimminich/juice-shop:v17.1.1
+        ports:
+          - 3000:3000
 
-steps:
-  - name: Wait for service
-    shell: bash
-    run: |
-      set -euo pipefail
+    steps:
+      - name: Wait for service
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      # Wait for HTTP readiness instead of using a fixed startup delay.
-      ready=false
-      for attempt in $(seq 1 60); do
-        if curl --fail --silent --max-time 3 \
-          http://localhost:3000/ > /dev/null; then
-          ready=true
-          break
-        fi
-        sleep 2
-      done
-      [[ "$ready" == true ]]
+          # Wait for HTTP readiness instead of using a fixed startup delay.
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --max-time 3 \
+              http://localhost:3000/ > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "$ready" == true ]]
 
-      # Preserve the original admin-login check as separate evidence.
-      curl --fail --silent --show-error --max-time 10 \
-        -X POST \
-        -H 'Content-Type: application/json' \
-        --data-binary "{\"email\":\"' or 1=1 -- -\",\"password\":\"pass\"}" \
-        http://localhost:3000/rest/user/login \
-        > login-response.json
+          # Preserve the original admin-login check as separate evidence.
+          curl --fail --silent --show-error --max-time 10 \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            --data-binary "{\"email\":\"' or 1=1 -- -\",\"password\":\"pass\"}" \
+            http://localhost:3000/rest/user/login \
+            > login-response.json
 
-  - name: Get payloads
-    shell: bash
-    run: |
-      set -euo pipefail
-      wget --timeout=30 --tries=3 \
-        -O SQL-Injection \
-        'https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection'
+      - name: Get payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget --timeout=30 --tries=3 \
+            -O SQL-Injection \
+            'https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection'
 
-      # Escape payloads for insertion inside a JSON string.
-      python3 - <<'PY'
-      import hashlib
-      import json
-      from pathlib import Path
+          # Escape payloads for insertion inside a JSON string.
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
 
-      source = Path("SQL-Injection")
-      values = list(dict.fromkeys(
-          line for line in source.read_text(
-              encoding="utf-8", errors="replace"
-          ).splitlines()
-          if line.strip() and not line.lstrip().startswith("#")
-      ))
-      if not values:
-          raise SystemExit("Downloaded payload list is empty")
+          source = Path("SQL-Injection")
+          values = list(dict.fromkeys(
+              line for line in source.read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          ))
+          if not values:
+              raise SystemExit("Downloaded payload list is empty")
 
-      Path("payloads-json.txt").write_text(
-          "".join(json.dumps(value)[1:-1] + "\n" for value in values),
-          encoding="utf-8",
-      )
-      Path("payloads.sha256").write_text(
-          hashlib.sha256(source.read_bytes()).hexdigest() + "\n"
-      )
-      PY
-
-  - name: Install fuzzing
-    shell: bash
-    run: |
-      set -euo pipefail
-      # Pin ffuf so tool updates do not change test behavior.
-      go install github.com/ffuf/ffuf/v2@v2.1.0
-      "$HOME/go/bin/ffuf" -V > ffuf-version.txt
-
-  - name: Run fuzzing
-    shell: bash
-    run: |
-      set -euo pipefail
-
-      # Fuzz the login email and record every HTTP response status.
-      "$HOME/go/bin/ffuf" \
-        -u http://localhost:3000/rest/user/login \
-        -X POST \
-        -H 'Content-Type: application/json' \
-        -d '{"email":"FUZZ","password":"pass"}' \
-        -w payloads-json.txt:FUZZ \
-        -mc all \
-        -t 5 \
-        -rate 25 \
-        -timeout 10 \
-        -maxtime 300 \
-        -noninteractive \
-        -of json \
-        -o ffuf-results.json \
-        2>&1 | tee ffuf.log
-
-      # Fail if fuzzing produced no evidence or skipped payloads.
-      python3 - <<'PY'
-      import json
-      from pathlib import Path
-
-      expected = len(Path("payloads-json.txt").read_text().splitlines())
-      report = json.loads(Path("ffuf-results.json").read_text())
-      results = report.get("results", [])
-      if not results or len(results) != expected:
-          raise SystemExit(
-              f"Incomplete fuzzing: {len(results)} responses "
-              f"for {expected} payloads"
+          Path("payloads-json.txt").write_text(
+              "".join(json.dumps(value)[1:-1] + "\n" for value in values),
+              encoding="utf-8",
           )
-      print(f"Validated {len(results)} recorded HTTP responses.")
-      PY
+          Path("payloads.sha256").write_text(
+              hashlib.sha256(source.read_bytes()).hexdigest() + "\n"
+          )
+          PY
 
-  - name: Get Logs from Service
-    if: always()
-    env:
-      JUICE_CONTAINER_ID: ${{ job.services.juice.id }}
-    run: |
-      # Capture only this workflow's Juice Shop container.
-      docker logs "$JUICE_CONTAINER_ID" > juice-logs.log 2>&1
+      - name: Install fuzzing
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pin ffuf so tool updates do not change test behavior.
+          go install github.com/ffuf/ffuf/v2@v2.1.0
+          "$HOME/go/bin/ffuf" -V > ffuf-version.txt
 
-  - name: Upload results
-    if: always()
-    uses: actions/upload-artifact@v4
-    with:
-      name: security-reports-bundle
-      if-no-files-found: error
-      path: |
-        juice-logs.log
-        login-response.json
-        SQL-Injection
-        payloads-json.txt
-        payloads.sha256
-        ffuf-version.txt
-        ffuf.log
-        ffuf-results.json
+      - name: Run fuzzing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fuzz the login email and record every HTTP response status.
+          "$HOME/go/bin/ffuf" \
+            -u http://localhost:3000/rest/user/login \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"FUZZ","password":"pass"}' \
+            -w payloads-json.txt:FUZZ \
+            -mc all \
+            -t 5 \
+            -rate 25 \
+            -timeout 10 \
+            -maxtime 300 \
+            -noninteractive \
+            -of json \
+            -o ffuf-results.json \
+            2>&1 | tee ffuf.log
+
+          # Fail if fuzzing produced no evidence or skipped payloads.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected = len(Path("payloads-json.txt").read_text().splitlines())
+          report = json.loads(Path("ffuf-results.json").read_text())
+          results = report.get("results", [])
+          if not results or len(results) != expected:
+              raise SystemExit(
+                  f"Incomplete fuzzing: {len(results)} responses "
+                  f"for {expected} payloads"
+              )
+          print(f"Validated {len(results)} recorded HTTP responses.")
+          PY
+
+      - name: Get Logs from Service
+        if: always()
+        env:
+          JUICE_CONTAINER_ID: ${{ job.services.juice.id }}
+        run: |
+          # Capture only this workflow's Juice Shop container.
+          docker logs "$JUICE_CONTAINER_ID" > juice-logs.log 2>&1
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-bundle
+          if-no-files-found: error
+          path: |
+            juice-logs.log
+            login-response.json
+            SQL-Injection
+            payloads-json.txt
+            payloads.sha256
+            ffuf-version.txt
+            ffuf.log
+            ffuf-results.json
